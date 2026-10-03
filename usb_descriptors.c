@@ -1,4 +1,7 @@
 // SPDX-License-Identifier: MIT
+/*
+ * microDOS v29 generic HID UART bridge descriptors.
+ */
 
 #include <string.h>
 #include "tusb.h"
@@ -16,7 +19,7 @@ tusb_desc_device_t const desc_device = {
     .bMaxPacketSize0    = CFG_TUD_ENDPOINT0_SIZE,
     .idVendor           = USB_VID,
     .idProduct          = USB_PID,
-    .bcdDevice          = 0x2800,
+    .bcdDevice          = 0x2900,
     .iManufacturer      = 0x01,
     .iProduct           = 0x02,
     .iSerialNumber      = 0x03,
@@ -84,37 +87,39 @@ enum {
 static char const *string_desc_arr[] = {
     (const char[]){0x09, 0x04},
     "microDOS",
-    "microDOS HID UART bridge v28",
-    "MDHID28"
+    "microDOS HID UART bridge v29",
+    "MDHID29"
 };
 
 static uint16_t desc_str[64];
 
 uint16_t const *tud_descriptor_string_cb(uint8_t index, uint16_t langid)
 {
-    (void)langid;
-
     size_t count;
+
+    (void)langid;
 
     if (index == STRID_LANGID) {
         memcpy(&desc_str[1], string_desc_arr[0], 2);
         count = 1;
     } else {
+        const char *s;
+
         if (index >= (sizeof(string_desc_arr) / sizeof(string_desc_arr[0])))
             return NULL;
 
-        const char *s = string_desc_arr[index];
+        s = string_desc_arr[index];
         count = strlen(s);
 
-        if (count > 63)
-            count = 63;
+        if (count > 63u)
+            count = 63u;
 
         for (size_t i = 0; i < count; ++i)
             desc_str[1 + i] = (uint8_t)s[i];
     }
 
     desc_str[0] =
-        (uint16_t)((TUSB_DESC_STRING << 8) | (2 * count + 2));
+        (uint16_t)((TUSB_DESC_STRING << 8) | (2u * count + 2u));
 
     return desc_str;
 }

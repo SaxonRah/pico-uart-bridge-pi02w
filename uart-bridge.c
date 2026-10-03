@@ -1,8 +1,6 @@
 // SPDX-License-Identifier: MIT
 /*
- * microDOS Raspberry Pi Zero 2 W bridge - v28 HID transport
- *
- * This version abandons USB CDC entirely.
+ * microDOS Raspberry Pi Zero 2 W bridge - v29 HID bidirectional UART transport
  *
  * USB:
  *   TinyUSB generic HID IN/OUT
@@ -10,23 +8,28 @@
  *
  * UART:
  *   UART0
- *   GP16 TX
- *   GP17 RX
+ *   GP16 TX -> Pi GPIO15 RX
+ *   GP17 RX <- Pi GPIO14 TX
  *   115200 8N1
  *
  * Pi reset:
  *   GP2 -> external transistor -> Pi RUN
  *
- * Host OUT commands:
+ * Backward-compatible host OUT control commands:
  *   P = PONG
  *   S = STATUS
- *   C = clear stats/ring
+ *   C = clear stats/rings
  *   H = hold Pi reset
  *   L = release Pi reset
  *
+ * New host OUT UART frame:
+ *   byte 0 = 0x10
+ *   byte 1 = payload length 0..62
+ *   byte 2.. = bytes to transmit to the Raspberry Pi UART
+ *
  * Device IN frames, fixed 64 bytes:
  *
- *   byte 0 = 0x01 : UART data
+ *   byte 0 = 0x01 : UART RX data from Raspberry Pi
  *   byte 1 = payload length 0..62
  *   byte 2.. = UART bytes
  *
@@ -41,16 +44,20 @@
  *   5 STATUS
  *
  * STATUS payload, little endian:
- *   +2  uint32 rx_bytes
- *   +6  uint32 ring_drops
- *   +10 uint32 queued
+ *   +2  uint32 rx_bytes             Pi -> Pico UART bytes received
+ *   +6  uint32 rx_ring_drops
+ *   +10 uint32 rx_queued
  *   +14 uint32 hid_reports_sent
  *   +18 uint32 hid_report_failures
  *   +22 uint32 actual_baud
  *   +26 uint8  GP17
  *   +27 uint8  uart_readable
- *   +28 uint8  last_byte
+ *   +28 uint8  last_rx_byte
  *   +29 uint8  mounted
+ *   +30 uint32 tx_bytes             Pico -> Pi UART bytes transmitted
+ *   +34 uint32 tx_ring_drops
+ *   +38 uint32 tx_queued
+ *   +42 uint8  last_tx_byte
  */
 
 #include <hardware/uart.h>
@@ -69,9 +76,12 @@
 
 #define PI_RUN_RESET_PIN 2u
 
-#define RING_SIZE 8192u
-#define HID_REPORT_SIZE 64u
+#define RX_RING_SIZE 8192u
+#define TX_RING_SIZE 2048u
+
+#define MD_HID_REPORT_SIZE 64u
 #define HID_UART_PAYLOAD 62u
+#define HOST_FRAME_UART_TX 0x10u
 
 enum {
     RESP_PONG = 1,
@@ -82,23 +92,38 @@ enum {
 };
 
 typedef struct {
-    uint8_t data[RING_SIZE];
+    uint8_t data[RX_RING_SIZE];
     uint32_t head;
     uint32_t tail;
     uint32_t count;
-} byte_ring_t;
+} rx_ring_t;
 
-static byte_ring_t ringbuf;
+typedef struct {
+    uint8_t data[TX_RING_SIZE];
+    uint32_t head;
+    uint32_t tail;
+    uint32_t count;
+} tx_ring_t;
+
+static rx_ring_t rx_ring;
+static tx_ring_t tx_ring;
 
 static uint32_t actual_baud;
+
 static uint32_t rx_bytes;
-static uint32_t ring_drops;
+static uint32_t rx_ring_drops;
+static uint8_t last_rx_byte;
+
+static uint32_t tx_bytes;
+static uint32_t tx_ring_drops;
+static uint8_t last_tx_byte;
+
 static uint32_t hid_reports_sent;
 static uint32_t hid_report_failures;
-static uint8_t last_byte;
+
 static volatile bool mounted;
 
-static uint8_t control_frame[HID_REPORT_SIZE];
+static uint8_t control_frame[MD_HID_REPORT_SIZE];
 static bool control_pending;
 
 static void put_u32le(uint8_t *p, uint32_t v)
@@ -109,52 +134,92 @@ static void put_u32le(uint8_t *p, uint32_t v)
     p[3] = (uint8_t)(v >> 24);
 }
 
-static void ring_clear(void)
+static void rx_ring_clear(void)
 {
-    ringbuf.head = 0u;
-    ringbuf.tail = 0u;
-    ringbuf.count = 0u;
+    rx_ring.head = 0u;
+    rx_ring.tail = 0u;
+    rx_ring.count = 0u;
 }
 
-static void ring_push(uint8_t ch)
+static void tx_ring_clear(void)
 {
-    if (ringbuf.count == RING_SIZE) {
-        ringbuf.tail = (ringbuf.tail + 1u) % RING_SIZE;
-        ringbuf.count--;
-        ring_drops++;
+    tx_ring.head = 0u;
+    tx_ring.tail = 0u;
+    tx_ring.count = 0u;
+}
+
+static void rx_ring_push(uint8_t ch)
+{
+    /*
+     * RX capture favors newest output if the host ever falls behind.
+     * This preserves the v28 behavior.
+     */
+    if (rx_ring.count == RX_RING_SIZE) {
+        rx_ring.tail = (rx_ring.tail + 1u) % RX_RING_SIZE;
+        rx_ring.count--;
+        rx_ring_drops++;
     }
 
-    ringbuf.data[ringbuf.head] = ch;
-    ringbuf.head = (ringbuf.head + 1u) % RING_SIZE;
-    ringbuf.count++;
+    rx_ring.data[rx_ring.head] = ch;
+    rx_ring.head = (rx_ring.head + 1u) % RX_RING_SIZE;
+    rx_ring.count++;
 }
 
-static uint32_t ring_peek_payload(uint8_t *dst, uint32_t max_count)
+static bool tx_ring_push(uint8_t ch)
 {
-    uint32_t n = ringbuf.count;
-    uint32_t pos = ringbuf.tail;
+    /*
+     * TX input must preserve byte order.  If the queue is full, reject the
+     * newest byte rather than deleting an older byte in the middle of a DOS
+     * command line.
+     */
+    if (tx_ring.count == TX_RING_SIZE) {
+        tx_ring_drops++;
+        return false;
+    }
+
+    tx_ring.data[tx_ring.head] = ch;
+    tx_ring.head = (tx_ring.head + 1u) % TX_RING_SIZE;
+    tx_ring.count++;
+    return true;
+}
+
+static bool tx_ring_pop(uint8_t *ch)
+{
+    if (tx_ring.count == 0u)
+        return false;
+
+    *ch = tx_ring.data[tx_ring.tail];
+    tx_ring.tail = (tx_ring.tail + 1u) % TX_RING_SIZE;
+    tx_ring.count--;
+    return true;
+}
+
+static uint32_t rx_ring_peek_payload(uint8_t *dst, uint32_t max_count)
+{
+    uint32_t n = rx_ring.count;
+    uint32_t pos = rx_ring.tail;
 
     if (n > max_count)
         n = max_count;
 
     for (uint32_t i = 0; i < n; ++i) {
-        dst[i] = ringbuf.data[pos];
-        pos = (pos + 1u) % RING_SIZE;
+        dst[i] = rx_ring.data[pos];
+        pos = (pos + 1u) % RX_RING_SIZE;
     }
 
     return n;
 }
 
-static void ring_consume(uint32_t n)
+static void rx_ring_consume(uint32_t n)
 {
-    if (n > ringbuf.count)
-        n = ringbuf.count;
+    if (n > rx_ring.count)
+        n = rx_ring.count;
 
-    ringbuf.tail = (ringbuf.tail + n) % RING_SIZE;
-    ringbuf.count -= n;
+    rx_ring.tail = (rx_ring.tail + n) % RX_RING_SIZE;
+    rx_ring.count -= n;
 }
 
-static void discard_uart_fifo(void)
+static void discard_uart_rx_fifo(void)
 {
     while (uart_is_readable(UART_ID))
         (void)uart_getc(UART_ID);
@@ -162,14 +227,20 @@ static void discard_uart_fifo(void)
 
 static void clear_runtime_stats(void)
 {
-    ring_clear();
-    discard_uart_fifo();
+    rx_ring_clear();
+    tx_ring_clear();
+    discard_uart_rx_fifo();
 
     rx_bytes = 0u;
-    ring_drops = 0u;
+    rx_ring_drops = 0u;
+    last_rx_byte = 0u;
+
+    tx_bytes = 0u;
+    tx_ring_drops = 0u;
+    last_tx_byte = 0u;
+
     hid_reports_sent = 0u;
     hid_report_failures = 0u;
-    last_byte = 0u;
 }
 
 static void queue_simple_response(uint8_t code)
@@ -188,21 +259,26 @@ static void queue_status_response(void)
     control_frame[1] = RESP_STATUS;
 
     put_u32le(&control_frame[2], rx_bytes);
-    put_u32le(&control_frame[6], ring_drops);
-    put_u32le(&control_frame[10], ringbuf.count);
+    put_u32le(&control_frame[6], rx_ring_drops);
+    put_u32le(&control_frame[10], rx_ring.count);
     put_u32le(&control_frame[14], hid_reports_sent);
     put_u32le(&control_frame[18], hid_report_failures);
     put_u32le(&control_frame[22], actual_baud);
 
     control_frame[26] = gpio_get(UART_RX_PIN) ? 1u : 0u;
     control_frame[27] = uart_is_readable(UART_ID) ? 1u : 0u;
-    control_frame[28] = last_byte;
+    control_frame[28] = last_rx_byte;
     control_frame[29] = mounted ? 1u : 0u;
+
+    put_u32le(&control_frame[30], tx_bytes);
+    put_u32le(&control_frame[34], tx_ring_drops);
+    put_u32le(&control_frame[38], tx_ring.count);
+    control_frame[42] = last_tx_byte;
 
     control_pending = true;
 }
 
-static void handle_command(uint8_t command)
+static void handle_control_command(uint8_t command)
 {
     switch (command) {
         case 'P':
@@ -239,14 +315,52 @@ static void handle_command(uint8_t command)
     }
 }
 
-static void drain_uart(void)
+static void handle_uart_tx_frame(uint8_t const *buffer, uint16_t bufsize)
+{
+    uint32_t n;
+
+    if (bufsize < 2u)
+        return;
+
+    n = buffer[1];
+
+    if (n > HID_UART_PAYLOAD)
+        n = HID_UART_PAYLOAD;
+
+    if (n > (uint32_t)(bufsize - 2u))
+        n = (uint32_t)(bufsize - 2u);
+
+    for (uint32_t i = 0; i < n; ++i)
+        (void)tx_ring_push(buffer[2u + i]);
+}
+
+static void drain_uart_rx(void)
 {
     while (uart_is_readable(UART_ID)) {
         const uint8_t ch = (uint8_t)uart_getc(UART_ID);
 
         rx_bytes++;
-        last_byte = ch;
-        ring_push(ch);
+        last_rx_byte = ch;
+        rx_ring_push(ch);
+    }
+}
+
+static void drain_uart_tx(void)
+{
+    /*
+     * Only touch the UART data register when the hardware FIFO has space.
+     * This keeps TinyUSB servicing non-blocking even when the host pastes a
+     * longer DOS command.
+     */
+    while (tx_ring.count != 0u && uart_is_writable(UART_ID)) {
+        uint8_t ch;
+
+        if (!tx_ring_pop(&ch))
+            break;
+
+        uart_putc_raw(UART_ID, ch);
+        tx_bytes++;
+        last_tx_byte = ch;
     }
 }
 
@@ -263,24 +377,24 @@ static void hid_tx_poll(void)
         return;
     }
 
-    if (ringbuf.count != 0u) {
-        uint8_t report[HID_REPORT_SIZE];
+    if (rx_ring.count != 0u) {
+        uint8_t report[MD_HID_REPORT_SIZE];
+        uint32_t n;
+
         memset(report, 0, sizeof(report));
 
         report[0] = 0x01;
 
-        const uint32_t n =
-            ring_peek_payload(&report[2], HID_UART_PAYLOAD);
-
+        n = rx_ring_peek_payload(&report[2], HID_UART_PAYLOAD);
         report[1] = (uint8_t)n;
 
         if (tud_hid_report(0, report, sizeof(report))) {
-            ring_consume(n);
+            rx_ring_consume(n);
             hid_reports_sent++;
         } else {
             /*
-             * Keep the bytes queued and retry later. Unlike the old CDC
-             * bridge, a failed USB submit cannot silently discard UART data.
+             * Keep bytes queued and retry later.  A failed USB submit must not
+             * silently discard Raspberry Pi console output.
              */
             hid_report_failures++;
         }
@@ -289,14 +403,22 @@ static void hid_tx_poll(void)
 
 int main(void)
 {
-    ring_clear();
+    rx_ring_clear();
+    tx_ring_clear();
 
     actual_baud = 0u;
+
     rx_bytes = 0u;
-    ring_drops = 0u;
+    rx_ring_drops = 0u;
+    last_rx_byte = 0u;
+
+    tx_bytes = 0u;
+    tx_ring_drops = 0u;
+    last_tx_byte = 0u;
+
     hid_reports_sent = 0u;
     hid_report_failures = 0u;
-    last_byte = 0u;
+
     mounted = false;
     control_pending = false;
 
@@ -326,12 +448,13 @@ int main(void)
 
     while (1) {
         /*
-         * Non-blocking TinyUSB service. Do not use tud_task() here because its
-         * default API may wait for an event. UART service must remain prompt.
+         * Non-blocking TinyUSB service.  UART service must remain prompt in
+         * both directions.
          */
         tud_task_ext(0, false);
 
-        drain_uart();
+        drain_uart_rx();
+        drain_uart_tx();
         hid_tx_poll();
 
         gpio_put(LED_PIN, mounted ? 1 : 0);
@@ -388,7 +511,15 @@ void tud_hid_set_report_cb(
     if (bufsize == 0u)
         return;
 
-    handle_command(buffer[0]);
+    if (buffer[0] == HOST_FRAME_UART_TX) {
+        handle_uart_tx_frame(buffer, bufsize);
+        return;
+    }
+
+    /*
+     * Preserve the v28 one-byte ASCII control protocol unchanged.
+     */
+    handle_control_command(buffer[0]);
 }
 
 void tud_hid_report_complete_cb(
