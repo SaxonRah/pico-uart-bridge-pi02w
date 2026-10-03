@@ -1,21 +1,31 @@
-// SPDX-License-Identifier: MIT
-/*
- * Copyright (c) 2021 Álvaro Fernández Rojas <noltari@gmail.com>
- * Copyright (c) 2020 Raspberry Pi (Trading) Ltd.
- * Copyright (c) 2020 Damien P. George
- */
-
-#if !defined(_TUSB_CONFIG_H_)
+#ifndef _TUSB_CONFIG_H_
 #define _TUSB_CONFIG_H_
 
-#include <tusb_option.h>
+#ifdef __cplusplus
+extern "C" {
+#endif
 
-#define CFG_TUSB_RHPORT0_MODE OPT_MODE_DEVICE
+#ifndef CFG_TUSB_MCU
+#error CFG_TUSB_MCU must be defined by the Pico SDK
+#endif
 
-#define CFG_TUD_CDC 2
-#define CFG_TUD_CDC_RX_BUFSIZE 1024
-#define CFG_TUD_CDC_TX_BUFSIZE 1024
+#define CFG_TUSB_OS                 OPT_OS_PICO
+#define CFG_TUD_ENABLED             1
 
-void usbd_serial_init(void);
+#ifndef CFG_TUD_ENDPOINT0_SIZE
+#define CFG_TUD_ENDPOINT0_SIZE      64
+#endif
 
-#endif /* _TUSB_CONFIG_H_ */
+#define CFG_TUD_CDC                 0
+#define CFG_TUD_MSC                 0
+#define CFG_TUD_HID                 1
+#define CFG_TUD_MIDI                0
+#define CFG_TUD_VENDOR              0
+
+#define CFG_TUD_HID_EP_BUFSIZE      64
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif
