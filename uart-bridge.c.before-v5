@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 /*
- * Copyright 2021 Álvaro Fernández Rojas <noltari@gmail.com>
+ * Copyright 2021 Ãlvaro FernÃ¡ndez Rojas <noltari@gmail.com>
  *
  * microDOS development additions:
  * - CDC 0 remains the Raspberry Pi UART console bridge on GP16/GP17.
@@ -9,8 +9,6 @@
  * - GP2 drives an external transistor that pulls Raspberry Pi RUN to GND.
  * - v4: CDC0 TX never manually clears TinyUSB endpoint state; forwarding
  *   is DTR-gated and capacity-aware.
- * - v5: CDC1/control TX is also capacity-aware and buffered in bridge-owned
- *   memory. The control port no longer emits an unsolicited banner on open.
  */
 
 #include <hardware/irq.h>
@@ -29,7 +27,6 @@
 #define LED_PIN 25
 
 #define BUFFER_SIZE 2560
-#define CONTROL_TX_BUFFER_SIZE 1024
 
 #define DEF_BIT_RATE 115200
 #define DEF_STOP_BITS 1
@@ -102,10 +99,7 @@ static uart_diag_t UART_DIAG[CFG_TUD_CDC];
 
 static volatile bool pi_reset_active;
 static volatile uint64_t pi_reset_release_at_us;
-
-static uint8_t control_tx_buffer[CONTROL_TX_BUFFER_SIZE];
-static uint32_t control_tx_pos;
-static uint32_t control_tx_dropped;
+static bool control_announced;
 
 static inline uint databits_usb2uart(uint8_t data_bits)
 {
@@ -143,59 +137,15 @@ static inline uint stopbits_usb2uart(uint8_t stop_bits)
         }
 }
 
-static void control_tx_flush(void)
-{
-        uint32_t available;
-        uint32_t wanted;
-        uint32_t count;
-
-        if (!tud_cdc_n_connected(CONTROL_ITF) || control_tx_pos == 0u)
-                return;
-
-        available = tud_cdc_n_write_available(CONTROL_ITF);
-        if (available == 0u)
-                return;
-
-        wanted = MIN(control_tx_pos, available);
-        count = tud_cdc_n_write(CONTROL_ITF, control_tx_buffer, wanted);
-        if (count == 0u)
-                return;
-
-        if (count < control_tx_pos) {
-                memmove(control_tx_buffer,
-                        &control_tx_buffer[count],
-                        control_tx_pos - count);
-        }
-
-        control_tx_pos -= count;
-        (void)tud_cdc_n_write_flush(CONTROL_ITF);
-}
-
 static void control_write(const char *text)
 {
         const size_t len = strlen(text);
-        uint32_t free_space;
-        uint32_t take;
 
-        if (!tud_cdc_n_connected(CONTROL_ITF) || len == 0u)
+        if (!tud_cdc_n_connected(CONTROL_ITF))
                 return;
 
-        /*
-         * Keep all CDC1 responses in bridge-owned memory until TinyUSB reports
-         * room for them. Never clear or reset TinyUSB endpoint state.
-         */
-        free_space = CONTROL_TX_BUFFER_SIZE - control_tx_pos;
-        take = MIN((uint32_t)len, free_space);
-
-        if (take != 0u) {
-                memcpy(&control_tx_buffer[control_tx_pos], text, take);
-                control_tx_pos += take;
-        }
-
-        if (take < len)
-                control_tx_dropped += (uint32_t)len - take;
-
-        control_tx_flush();
+        (void)tud_cdc_n_write(CONTROL_ITF, text, (uint32_t)len);
+        tud_cdc_n_write_flush(CONTROL_ITF);
 }
 
 static void pi_reset_begin(void)
@@ -225,7 +175,7 @@ static void pi_reset_poll(void)
 
 static void control_diag(void)
 {
-        char text[384];
+        char text[256];
         uart_data_t *ud = &UART_DATA[CONSOLE_ITF];
         const uart_id_t *ui = &UART_ID[CONSOLE_ITF];
         uart_diag_t *dg = &UART_DIAG[CONSOLE_ITF];
@@ -249,8 +199,7 @@ static void control_diag(void)
         snprintf(text, sizeof(text),
                  "UART0 diag: cdc0=%u line=%02X txfree=%lu GP17=%u readable=%u "
                  "cfg=%lu/%u/%u/%u actual=%lu rx=%lu drop=%lu buf=%lu "
-                 "usbtx=%lu usb0=%lu polls=%lu last=%02X "
-                 "cdc1=%u line1=%02X txfree1=%lu ctrlbuf=%lu ctrldrop=%lu\r\n",
+                 "usbtx=%lu usb0=%lu polls=%lu last=%02X\r\n",
                  tud_cdc_n_connected(CONSOLE_ITF) ? 1u : 0u,
                  (unsigned)tud_cdc_n_get_line_state(CONSOLE_ITF),
                  (unsigned long)tud_cdc_n_write_available(CONSOLE_ITF),
@@ -267,12 +216,7 @@ static void control_diag(void)
                  (unsigned long)dg->usb_tx_bytes,
                  (unsigned long)dg->usb_tx_zero_writes,
                  (unsigned long)dg->rx_polls,
-                 (unsigned)dg->last_byte,
-                 tud_cdc_n_connected(CONTROL_ITF) ? 1u : 0u,
-                 (unsigned)tud_cdc_n_get_line_state(CONTROL_ITF),
-                 (unsigned long)tud_cdc_n_write_available(CONTROL_ITF),
-                 (unsigned long)control_tx_pos,
-                 (unsigned long)control_tx_dropped);
+                 (unsigned)dg->last_byte);
 
         control_write(text);
 }
@@ -285,7 +229,7 @@ static void control_diag_clear(void)
         /*
          * Clear only bridge-owned state.
          *
-         * Do NOT call tud_cdc_n_write_clear() here. TinyUSB's endpoint stream can
+         * Do NOT call tud_cdc_n_write_clear() here.  TinyUSB's endpoint stream can
          * have a transfer in flight; resetting the stream FIFO underneath that
          * transfer can leave CDC0 unable to make forward progress.
          */
@@ -308,14 +252,20 @@ static void control_process(void)
         uint8_t buffer[64];
         uint32_t available;
 
-        if (!tud_cdc_n_connected(CONTROL_ITF))
+        if (!tud_cdc_n_connected(CONTROL_ITF)) {
+                control_announced = false;
                 return;
+        }
 
-        /*
-         * No unsolicited banner on connect. CDC1 stays quiet until the host
-         * sends a command, avoiding TX during COM-port open/close transitions.
-         */
-        control_tx_flush();
+        if (!control_announced) {
+                control_write(
+                        "pico-uart-bridge microDOS control\r\n"
+                        "  R = hard reset Raspberry Pi RUN\r\n"
+                        "  D = show UART0 RX diagnostics\r\n"
+                        "  C = clear UART0 diagnostics + RX backlog\r\n"
+                        "  ? = show this help\r\n");
+                control_announced = true;
+        }
 
         available = tud_cdc_n_available(CONTROL_ITF);
         while (available != 0u) {
@@ -359,7 +309,6 @@ static void control_process(void)
         }
 
         pi_reset_poll();
-        control_tx_flush();
 }
 
 void update_uart_cfg(uint8_t itf)
@@ -428,7 +377,7 @@ void usb_write_bytes(uint8_t itf)
 
                 /*
                  * Respect TinyUSB's advertised TX FIFO capacity instead of repeatedly
-                 * asking it to accept the entire bridge backlog. tud_task() is allowed
+                 * asking it to accept the entire bridge backlog.  tud_task() is allowed
                  * to retire endpoint transfers between these small writes.
                  */
                 if (available != 0u) {
@@ -474,7 +423,7 @@ void core1_entry(void)
                 int con = 0;
 
                 /*
-                 * Service USB first, then sample DTR/connection state. This avoids
+                 * Service USB first, then sample DTR/connection state.  This avoids
                  * making forwarding decisions from a one-loop-old CDC line state.
                  */
                 tud_task();
@@ -488,11 +437,7 @@ void core1_entry(void)
                         con = 1;
                         control_process();
                 } else {
-                        /*
-                         * A new CDC1 session must not inherit stale replies from a
-                         * previous host session. Clear only bridge-owned state.
-                         */
-                        control_tx_pos = 0u;
+                        control_announced = false;
                         pi_reset_poll();
                 }
 
@@ -513,7 +458,7 @@ static inline void uart_read_bytes(uint8_t itf)
 
                 /*
                  * Always drain the hardware UART, even if the software buffer is
-                 * temporarily full. The old IRQ path stopped reading when uart_pos
+                 * temporarily full.  The old IRQ path stopped reading when uart_pos
                  * reached BUFFER_SIZE, leaving RX pending and allowing the interrupt
                  * to remain asserted indefinitely.
                  */
@@ -527,7 +472,7 @@ static inline void uart_read_bytes(uint8_t itf)
                                 /*
                                  * Never allow a closed/slow USB host to permanently wedge RX.
                                  * Drop the oldest half of the backlog in one operation and keep
-                                 * the newest data. Once a host opens CDC0, forwarding can recover
+                                 * the newest data.  Once a host opens CDC0, forwarding can recover
                                  * immediately without reflashing or resetting the Pico.
                                  */
                                 const uint32_t keep = BUFFER_SIZE / 2u;
@@ -624,7 +569,7 @@ void init_uart_data(uint8_t itf)
          * Use the hardware FIFO and poll RX from core 0.
          *
          * At 115200 baud this is extremely light work for the RP2040 and avoids
-         * the previous RX interrupt/full-buffer failure mode. CDC/TinyUSB still
+         * the previous RX interrupt/full-buffer failure mode.  CDC/TinyUSB still
          * runs independently on core 1.
          */
         uart_set_fifo_enabled(ui->inst, true);
@@ -634,9 +579,6 @@ void init_uart_data(uint8_t itf)
 
 int main(void)
 {
-        control_tx_pos = 0u;
-        control_tx_dropped = 0u;
-
         usbd_serial_init();
 
         /*
