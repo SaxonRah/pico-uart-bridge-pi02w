@@ -88,6 +88,8 @@ typedef struct {
 	volatile uint32_t rx_dropped;
 	volatile uint32_t rx_polls;
 	volatile uint32_t actual_baud;
+	volatile uint32_t usb_tx_bytes;
+	volatile uint32_t usb_tx_zero_writes;
 	volatile uint8_t last_byte;
 } uart_diag_t;
 
@@ -96,6 +98,7 @@ static uart_diag_t UART_DIAG[CFG_TUD_CDC];
 static volatile bool pi_reset_active;
 static volatile uint64_t pi_reset_release_at_us;
 static bool control_announced;
+static bool console_connected_prev;
 
 static inline uint databits_usb2uart(uint8_t data_bits)
 {
@@ -193,8 +196,12 @@ static void control_diag(void)
 	mutex_exit(&ud->lc_mtx);
 
 	snprintf(text, sizeof(text),
-		 "UART0 diag: GP17=%u readable=%u cfg=%lu/%u/%u/%u "
-		 "actual=%lu rx=%lu drop=%lu buf=%lu polls=%lu last=%02X\r\n",
+		 "UART0 diag: cdc0=%u line=%02X txfree=%lu GP17=%u readable=%u "
+		 "cfg=%lu/%u/%u/%u actual=%lu rx=%lu drop=%lu buf=%lu "
+		 "usbtx=%lu usb0=%lu polls=%lu last=%02X\r\n",
+		 tud_cdc_n_connected(CONSOLE_ITF) ? 1u : 0u,
+		 (unsigned)tud_cdc_n_get_line_state(CONSOLE_ITF),
+		 (unsigned long)tud_cdc_n_write_available(CONSOLE_ITF),
 		 gpio_get(ui->rx_pin) ? 1u : 0u,
 		 uart_is_readable(ui->inst) ? 1u : 0u,
 		 (unsigned long)bit_rate,
@@ -205,6 +212,8 @@ static void control_diag(void)
 		 (unsigned long)dg->rx_bytes,
 		 (unsigned long)dg->rx_dropped,
 		 (unsigned long)buffered,
+		 (unsigned long)dg->usb_tx_bytes,
+		 (unsigned long)dg->usb_tx_zero_writes,
 		 (unsigned long)dg->rx_polls,
 		 (unsigned)dg->last_byte);
 
@@ -213,14 +222,34 @@ static void control_diag(void)
 
 static void control_diag_clear(void)
 {
+	uart_data_t *ud = &UART_DATA[CONSOLE_ITF];
 	uart_diag_t *dg = &UART_DIAG[CONSOLE_ITF];
+
+	/*
+	 * Clear both the diagnostic counters and any stale Pi->USB backlog.
+	 * The earlier diagnostic build reset only the counters; uart_pos could
+	 * remain stuck at BUFFER_SIZE, causing every byte of the next Pi boot to
+	 * be received correctly and then dropped.
+	 */
+	mutex_enter_blocking(&ud->uart_mtx);
+	ud->uart_pos = 0;
+	mutex_exit(&ud->uart_mtx);
+
+	/*
+	 * Also clear TinyUSB's CDC0 TX FIFO.  The v2 diagnostic proved that
+	 * tud_cdc_n_write() could accept Pi bytes while the terminal was not
+	 * actually draining the endpoint, leaving CDC0 permanently full.
+	 */
+	(void)tud_cdc_n_write_clear(CONSOLE_ITF);
 
 	dg->rx_bytes = 0;
 	dg->rx_dropped = 0;
 	dg->rx_polls = 0;
+	dg->usb_tx_bytes = 0;
+	dg->usb_tx_zero_writes = 0;
 	dg->last_byte = 0;
 
-	control_write("UART0 diagnostics cleared\r\n");
+	control_write("UART0 diagnostics + RX backlog + USB TX FIFO cleared\r\n");
 }
 
 static void control_process(void)
@@ -238,7 +267,7 @@ static void control_process(void)
 			"pico-uart-bridge microDOS control\r\n"
 			"  R = hard reset Raspberry Pi RUN\r\n"
 			"  D = show UART0 RX diagnostics\r\n"
-			"  C = clear UART0 RX diagnostics\r\n"
+			"  C = clear UART0 diagnostics + RX backlog + USB TX FIFO\r\n"
 			"  ? = show this help\r\n");
 		control_announced = true;
 	}
@@ -272,7 +301,7 @@ static void control_process(void)
 						"microDOS Pi control\r\n"
 						"  R = hard reset Raspberry Pi RUN\r\n"
 						"  D = show UART0 RX diagnostics\r\n"
-						"  C = clear UART0 RX diagnostics\r\n");
+						"  C = clear UART0 diagnostics + RX backlog + USB TX FIFO\r\n");
 					break;
 
 				default:
@@ -337,16 +366,35 @@ void usb_read_bytes(uint8_t itf)
 void usb_write_bytes(uint8_t itf)
 {
 	uart_data_t *ud = &UART_DATA[itf];
+	uart_diag_t *dg = &UART_DIAG[itf];
+
+	/*
+	 * Do not feed TinyUSB's TX FIFO unless the host has asserted DTR.
+	 * Keep Pi output in our own software buffer while the terminal is closed.
+	 */
+	if (!tud_cdc_n_connected(itf))
+		return;
 
 	if (ud->uart_pos &&
 	    mutex_try_enter(&ud->uart_mtx, NULL)) {
 		uint32_t count;
 
+		/*
+		 * Connected path only.  A zero return now means the active CDC0 TX
+		 * stream is temporarily full, rather than "terminal is closed".
+		 */
 		count = tud_cdc_n_write(itf, ud->uart_buffer, ud->uart_pos);
-		if (count < ud->uart_pos)
-			memmove(ud->uart_buffer, &ud->uart_buffer[count],
-			       ud->uart_pos - count);
-		ud->uart_pos -= count;
+
+		if (count != 0u) {
+			dg->usb_tx_bytes += count;
+
+			if (count < ud->uart_pos)
+				memmove(ud->uart_buffer, &ud->uart_buffer[count],
+				       ud->uart_pos - count);
+			ud->uart_pos -= count;
+		} else {
+			dg->usb_tx_zero_writes++;
+		}
 
 		mutex_exit(&ud->uart_mtx);
 
@@ -370,13 +418,26 @@ void usb_cdc_process(uint8_t itf)
 void core1_entry(void)
 {
 	tusb_init();
+	console_connected_prev = false;
 
 	while (1) {
 		int con = 0;
+		const bool console_connected = tud_cdc_n_connected(CONSOLE_ITF);
 
 		tud_task();
 
-		if (tud_cdc_n_connected(CONSOLE_ITF)) {
+		/*
+		 * A DTR transition is a new terminal session.  Drop anything stranded
+		 * inside TinyUSB's TX FIFO, but keep our own Pi UART backlog.  On the
+		 * next connected iteration that backlog is sent to the fresh CDC0
+		 * session.
+		 */
+		if (console_connected != console_connected_prev) {
+			(void)tud_cdc_n_write_clear(CONSOLE_ITF);
+			console_connected_prev = console_connected;
+		}
+
+		if (console_connected) {
 			con = 1;
 			usb_cdc_process(CONSOLE_ITF);
 		}
@@ -416,12 +477,25 @@ static inline void uart_read_bytes(uint8_t itf)
 			dg->rx_bytes++;
 			dg->last_byte = ch;
 
-			if (ud->uart_pos < BUFFER_SIZE) {
-				ud->uart_buffer[ud->uart_pos] = ch;
-				ud->uart_pos++;
-			} else {
-				dg->rx_dropped++;
+			if (ud->uart_pos >= BUFFER_SIZE) {
+				/*
+				 * Never allow a closed/slow USB host to permanently wedge RX.
+				 * Drop the oldest half of the backlog in one operation and keep
+				 * the newest data.  Once a host opens CDC0, forwarding can recover
+				 * immediately without reflashing or resetting the Pico.
+				 */
+				const uint32_t keep = BUFFER_SIZE / 2u;
+				const uint32_t discard = BUFFER_SIZE - keep;
+
+				memmove(ud->uart_buffer,
+				        &ud->uart_buffer[discard],
+				        keep);
+				ud->uart_pos = keep;
+				dg->rx_dropped += discard;
 			}
+
+			ud->uart_buffer[ud->uart_pos] = ch;
+			ud->uart_pos++;
 		}
 
 		mutex_exit(&ud->uart_mtx);
