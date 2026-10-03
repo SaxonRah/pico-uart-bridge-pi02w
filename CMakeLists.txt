@@ -20,6 +20,7 @@ target_include_directories(uart_bridge PUBLIC
 
 target_link_libraries(uart_bridge
 	hardware_flash
+	hardware_watchdog
 	pico_multicore
 	pico_stdlib
 	tinyusb_device)

@@ -11,11 +11,19 @@
  *   is DTR-gated and capacity-aware.
  * - v5: CDC1/control TX is also capacity-aware and buffered in bridge-owned
  *   memory. The control port no longer emits an unsolicited banner on open.
+ * - v6: CDC1 adds an explicit bridge watchdog reboot command ('B') plus a
+ *   version query ('V').
+ * - v7: B performs a clean USB detach before the watchdog reset.
+ * - v8: B is now a two-phase reset handshake.  It ACKs "RESET ARMED" first,
+ *   waits for the host to close both CDC ports (or a 3 s safety timeout),
+ *   then detaches USB for 750 ms and watchdog-resets the RP2040.  This gives
+ *   Windows time to close COM handles before the USB device disappears.
  */
 
 #include <hardware/irq.h>
 #include <hardware/structs/sio.h>
 #include <hardware/uart.h>
+#include <hardware/watchdog.h>
 #include <pico/multicore.h>
 #include <pico/stdlib.h>
 #include <stdio.h>
@@ -102,6 +110,10 @@ static uart_diag_t UART_DIAG[CFG_TUD_CDC];
 
 static volatile bool pi_reset_active;
 static volatile uint64_t pi_reset_release_at_us;
+
+static volatile bool bridge_reboot_active;
+static volatile uint8_t bridge_reboot_stage;
+static volatile uint64_t bridge_reboot_at_us;
 
 static uint8_t control_tx_buffer[CONTROL_TX_BUFFER_SIZE];
 static uint32_t control_tx_pos;
@@ -198,6 +210,63 @@ static void control_write(const char *text)
         control_tx_flush();
 }
 
+static void bridge_reboot_begin(void)
+{
+        /*
+         * Two-phase reset handshake.
+         *
+         * First ACK the command while CDC1 is still healthy.  The host then
+         * closes COM3 and COM8.  Only after both CDC line states are gone do
+         * we detach USB.  The 3 s deadline is a safety fallback in case a
+         * Windows CDC close never reaches TinyUSB.
+         */
+        bridge_reboot_stage = 0u;
+        bridge_reboot_at_us = time_us_64() + 3000000ull;
+        bridge_reboot_active = true;
+
+        control_write("BRIDGE RESET ARMED\r\n");
+}
+
+static void bridge_reboot_poll(void)
+{
+        const uint64_t now = time_us_64();
+
+        if (!bridge_reboot_active)
+                return;
+
+        if (bridge_reboot_stage == 0u) {
+                const bool console_closed =
+                        !tud_cdc_n_connected(CONSOLE_ITF);
+                const bool control_closed =
+                        !tud_cdc_n_connected(CONTROL_ITF);
+                const bool timeout =
+                        (int64_t)(now - bridge_reboot_at_us) >= 0;
+
+                if (!((console_closed && control_closed) || timeout))
+                        return;
+
+                /*
+                 * The host has had time to close its COM handles.  Now create
+                 * a real USB removal interval before resetting the RP2040.
+                 */
+                (void)tud_disconnect();
+                bridge_reboot_stage = 1u;
+                bridge_reboot_at_us = now + 750000ull;
+                return;
+        }
+
+        if ((int64_t)(now - bridge_reboot_at_us) < 0)
+                return;
+
+        /*
+         * Full RP2040 watchdog reset.  Startup calls tusb_init() again,
+         * producing a fresh composite CDC device/session.
+         */
+        watchdog_reboot(0u, 0u, 0u);
+        for (;;)
+                tight_loop_contents();
+}
+
 static void pi_reset_begin(void)
 {
         /*
@@ -250,7 +319,8 @@ static void control_diag(void)
                  "UART0 diag: cdc0=%u line=%02X txfree=%lu GP17=%u readable=%u "
                  "cfg=%lu/%u/%u/%u actual=%lu rx=%lu drop=%lu buf=%lu "
                  "usbtx=%lu usb0=%lu polls=%lu last=%02X "
-                 "cdc1=%u line1=%02X txfree1=%lu ctrlbuf=%lu ctrldrop=%lu\r\n",
+                 "cdc1=%u line1=%02X txfree1=%lu ctrlbuf=%lu ctrldrop=%lu "
+                 "reboot=%u stage=%u\r\n",
                  tud_cdc_n_connected(CONSOLE_ITF) ? 1u : 0u,
                  (unsigned)tud_cdc_n_get_line_state(CONSOLE_ITF),
                  (unsigned long)tud_cdc_n_write_available(CONSOLE_ITF),
@@ -272,7 +342,9 @@ static void control_diag(void)
                  (unsigned)tud_cdc_n_get_line_state(CONTROL_ITF),
                  (unsigned long)tud_cdc_n_write_available(CONTROL_ITF),
                  (unsigned long)control_tx_pos,
-                 (unsigned long)control_tx_dropped);
+                 (unsigned long)control_tx_dropped,
+                 bridge_reboot_active ? 1u : 0u,
+                 (unsigned)bridge_reboot_stage);
 
         control_write(text);
 }
@@ -341,12 +413,26 @@ static void control_process(void)
                                         control_diag_clear();
                                         break;
 
+                                case 'V':
+                                case 'v':
+                                        control_write(
+                                                "pico-uart-bridge microDOS v8\r\n");
+                                        break;
+
+                                case 'B':
+                                case 'b':
+                                        if (!bridge_reboot_active)
+                                                bridge_reboot_begin();
+                                        break;
+
                                 case '?':
                                         control_write(
                                                 "microDOS Pi control\r\n"
                                                 "  R = hard reset Raspberry Pi RUN\r\n"
                                                 "  D = show UART0 RX diagnostics\r\n"
-                                                "  C = clear UART0 diagnostics + RX backlog\r\n");
+                                                "  C = clear UART0 diagnostics + RX backlog\r\n"
+                                                "  V = bridge firmware version\r\n"
+                                                "  B = arm reset; host closes ports, then RP2040 reboots\r\n");
                                         break;
 
                                 default:
@@ -360,6 +446,7 @@ static void control_process(void)
 
         pi_reset_poll();
         control_tx_flush();
+        bridge_reboot_poll();
 }
 
 void update_uart_cfg(uint8_t itf)
@@ -494,6 +581,7 @@ void core1_entry(void)
                          */
                         control_tx_pos = 0u;
                         pi_reset_poll();
+                        bridge_reboot_poll();
                 }
 
                 gpio_put(LED_PIN, con);
@@ -636,6 +724,9 @@ int main(void)
 {
         control_tx_pos = 0u;
         control_tx_dropped = 0u;
+        bridge_reboot_active = false;
+        bridge_reboot_stage = 0u;
+        bridge_reboot_at_us = 0u;
 
         usbd_serial_init();
 
